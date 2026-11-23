@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
+import httpcore2
 import httpx2
 import pytest
 from pydantic import SecretStr
@@ -1678,6 +1679,85 @@ def test_sync_transport_connects_to_each_resolved_address_under_the_original_hos
             with pytest.raises(httpx2.TransportError):
                 client.get(f"http://127.0.0.1:{closed_port}/finding")
         assert len(server.requests) == 2
+
+
+class _SilentAddresses:
+    """One name resolving to three addresses; those in `silent` never answer a connection.
+
+    A silent address blocks until the connect timeout it was given, so the fake clock advances
+    by exactly that much. The tests then check the timeouts, not wall-clock time.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, silent: set[str]) -> None:
+        self.now = 1000.0
+        self.attempts: list[tuple[str, float | None]] = []
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.port = self.listener.getsockname()[1]
+        real = httpcore2.SyncBackend.connect_tcp
+        original = socket.getaddrinfo
+
+        def resolve(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+            if host != "api.proofline.invalid":
+                return original(host, port, *args, **kwargs)
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+                for address in ("192.0.2.1", "192.0.2.2", "127.0.0.1")
+            ]
+
+        def connect(backend: Any, host: str, port: int, timeout: Any = None, *args: Any) -> Any:
+            self.attempts.append((host, timeout))
+            if host in silent:
+                # A dropped SYN blocks for the whole timeout, so one must be given.
+                assert timeout is not None
+                assert 0 < timeout < float("inf")
+                self.now += timeout
+                raise httpcore2.ConnectTimeout("The address never answered.")
+            return real(backend, host, port, timeout, *args)
+
+        monkeypatch.setattr(socket, "getaddrinfo", resolve)
+        monkeypatch.setattr(httpcore2.SyncBackend, "connect_tcp", connect)
+        monkeypatch.setattr(_sync_http, "monotonic", lambda: self.now)
+
+    def hosts(self) -> list[str]:
+        return [host for host, _ in self.attempts]
+
+    def timeouts(self) -> list[float | None]:
+        return [timeout for _, timeout in self.attempts]
+
+
+def test_sync_connect_leaves_time_for_later_addresses_when_earlier_ones_drop_packets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    silent = _SilentAddresses(monkeypatch, {"192.0.2.1", "192.0.2.2"})
+    marker = _sync_http.IO_DEADLINE.set(silent.now + 9.0)
+    try:
+        backend = _sync_http.NetworkBackend()
+        backend.connect_tcp("api.proofline.invalid", silent.port, timeout=9.0).close()
+    finally:
+        _sync_http.IO_DEADLINE.reset(marker)
+        silent.listener.close()
+    # Each address gets an equal share of the time left: 9 s over three addresses, then 6 s
+    # over two, then 3 s for the last, which answers.
+    assert silent.hosts() == ["192.0.2.1", "192.0.2.2", "127.0.0.1"]
+    assert silent.timeouts() == [pytest.approx(3.0), pytest.approx(3.0), pytest.approx(3.0)]
+
+
+def test_sync_connect_never_outlasts_the_deadline_when_every_address_drops_packets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    silent = _SilentAddresses(monkeypatch, {"192.0.2.1", "192.0.2.2", "127.0.0.1"})
+    silent.listener.close()
+    started = silent.now
+    marker = _sync_http.IO_DEADLINE.set(started + 9.0)
+    try:
+        with pytest.raises(httpcore2.ConnectTimeout):
+            _sync_http.NetworkBackend().connect_tcp("api.proofline.invalid", 443, timeout=9.0)
+    finally:
+        _sync_http.IO_DEADLINE.reset(marker)
+    assert silent.hosts() == ["192.0.2.1", "192.0.2.2", "127.0.0.1"]
+    assert silent.now - started == pytest.approx(9.0)
 
 
 @MODES

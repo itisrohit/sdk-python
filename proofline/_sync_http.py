@@ -33,6 +33,20 @@ def bounded_timeout(timeout: float | None) -> float | None:
     return remaining if timeout is None else min(timeout, remaining)
 
 
+def shared_timeout(timeout: float | None, addresses_left: int) -> float | None:
+    """The time one address may use, so the addresses after it are still tried.
+
+    An address that drops packets blocks until its timeout. Without a share it would use
+    the whole request deadline, and a working address listed later would never be tried.
+    """
+    limit = bounded_timeout(timeout)
+    deadline = IO_DEADLINE.get()
+    if deadline is None:
+        return limit
+    share = max(deadline - monotonic(), 0.001) / addresses_left
+    return share if limit is None else min(limit, share)
+
+
 class Lookup:
     def __init__(self, host: str, port: int) -> None:
         self._host = host
@@ -110,10 +124,15 @@ class NetworkBackend(httpcore2.SyncBackend):
         socket_options: Iterable[Any] | None = None,
     ) -> httpcore2.NetworkStream:
         failure: httpcore2.ConnectError | httpcore2.ConnectTimeout | None = None
-        for address in resolve(host, port, bounded_timeout(timeout)):
+        addresses = resolve(host, port, bounded_timeout(timeout))
+        for index, address in enumerate(addresses):
             try:
                 stream = super().connect_tcp(
-                    address, port, bounded_timeout(timeout), local_address, socket_options
+                    address,
+                    port,
+                    shared_timeout(timeout, len(addresses) - index),
+                    local_address,
+                    socket_options,
                 )
             except (httpcore2.ConnectError, httpcore2.ConnectTimeout) as error:
                 failure = error
